@@ -15,7 +15,7 @@ NC='\033[0m'
 
 echo -e "${CYAN}----------------------------------------------------------"
 echo "----------------------------------------------------------"
-echo "                         Kamikazce                        "
+echo "              Kamikazce - Frappe/ERPNext v16              "
 echo "----------------------------------------------------------"
 echo -e "----------------------------------------------------------${NC}"
 
@@ -64,14 +64,16 @@ prompt_for_admin_password() {
 }
 
 # ----------------------------
-# Collect All Inputs at the Start
+# Check Root Privileges
 # ----------------------------
-
-# Check for Root Privileges
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}This script must be run as root. Please run with sudo or as root.${NC}"
     exit 1
 fi
+
+# ----------------------------
+# Collect All Inputs at the Start
+# ----------------------------
 
 # Prompt to create a new user
 echo -ne "${YELLOW}Do you want to create a new user? (yes/no):${NC} "
@@ -88,11 +90,49 @@ if [ "$create_user" = "yes" ]; then
     fi
     username="$new_username"
 else
-    username=$(logname)
+    username=$(logname 2>/dev/null || echo "$SUDO_USER")
 fi
 
-# Prompt for passwords
-prompt_for_mariadb_password
+# ----------------------------
+# MariaDB: Check existing installation
+# ----------------------------
+MARIADB_ALREADY_INSTALLED=false
+MARIADB_HAS_ROOT_PASSWORD=false
+
+if command -v mariadb &>/dev/null || command -v mysql &>/dev/null; then
+    echo -e "${YELLOW}MariaDB is already installed on this system.${NC}"
+    MARIADB_ALREADY_INSTALLED=true
+
+    # Check if root can connect without password
+    if mysql -u root --connect-timeout=5 -e "SELECT 1;" &>/dev/null 2>&1; then
+        echo -e "${YELLOW}MariaDB root has no password set (or uses unix_socket auth).${NC}"
+        MARIADB_HAS_ROOT_PASSWORD=false
+    else
+        echo -e "${YELLOW}MariaDB root already has a password configured.${NC}"
+        MARIADB_HAS_ROOT_PASSWORD=true
+        echo -ne "${YELLOW}Enter the existing MariaDB root password:${NC} "
+        read -s mariadb_password
+        echo
+        # Verify the provided password
+        if ! mysql -u root -p"$mariadb_password" --connect-timeout=5 -e "SELECT 1;" &>/dev/null 2>&1; then
+            echo -e "${RED}Incorrect MariaDB root password. Aborting.${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}MariaDB root password verified successfully.${NC}"
+    fi
+else
+    echo -e "${BLUE}MariaDB not found. Will install MariaDB 11.8.${NC}"
+fi
+
+# Prompt for new MariaDB password only if not already set
+if [ "$MARIADB_HAS_ROOT_PASSWORD" = false ] && [ "$MARIADB_ALREADY_INSTALLED" = false ]; then
+    prompt_for_mariadb_password
+elif [ "$MARIADB_HAS_ROOT_PASSWORD" = false ] && [ "$MARIADB_ALREADY_INSTALLED" = true ]; then
+    echo -e "${YELLOW}No root password is set. Please set a new MariaDB root password:${NC}"
+    prompt_for_mariadb_password
+fi
+
+# Prompt for Frappe admin password
 prompt_for_admin_password
 
 # Prompt for site name
@@ -124,194 +164,294 @@ export UNIQUE_ID
 echo -e "${BLUE}Updating and upgrading the system...${NC}"
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y apt-transport-https curl lsb-release gnupg ca-certificates software-properties-common
+apt-get install -y apt-transport-https curl lsb-release gnupg ca-certificates \
+    software-properties-common git pkg-config libmariadb-dev
 
 # ----------------------------
-# Install MariaDB 10.6
+# Install MariaDB 11.8 (skip if already installed)
 # ----------------------------
 install_mariadb() {
-    echo -e "${BLUE}Installing MariaDB Server 10.6...${NC}"    
-    apt-get install -y curl gnupg lsb-release software-properties-common    
-    curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup -o mariadb_repo_setup    
-    chmod +x mariadb_repo_setup    
-    sudo ./mariadb_repo_setup --mariadb-server-version="mariadb-10.6"    
-    rm mariadb_repo_setup    
-    apt-get update -y    
-    apt-get install -y mariadb-server mariadb-backup
-
-    # Verify MariaDB version
-    mariadb_version=$(mariadb --version | awk '{print $5}' | cut -d'.' -f1-2)
-    if [ "$mariadb_version" != "10.6" ]; then
-        echo -e "${RED}MariaDB version $mariadb_version installed, but version 10.6 is required.${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}MariaDB 10.6 installed successfully.${NC}"
+    echo -e "${BLUE}Installing MariaDB Server 11.8...${NC}"
+    curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup -o mariadb_repo_setup
+    chmod +x mariadb_repo_setup
+    bash ./mariadb_repo_setup --mariadb-server-version="mariadb-11.8"
+    rm mariadb_repo_setup
+    apt-get update -y
+    apt-get install -y mariadb-server mariadb-backup mariadb-client
+    echo -e "${GREEN}MariaDB 11.8 installed successfully.${NC}"
 }
 
-# Start MariaDB Service with Unique Configuration
-start_mariadb() {
-    echo -e "${BLUE}Starting MariaDB service with unique configuration...${NC}"
+if [ "$MARIADB_ALREADY_INSTALLED" = false ]; then
+    install_mariadb
+else
+    echo -e "${YELLOW}Skipping MariaDB installation (already installed).${NC}"
+    # Ensure MariaDB service is running
+    systemctl start mariadb 2>/dev/null || true
+fi
 
-    # Generate unique identifiers based on UNIQUE_ID
-    SOCKET_FILE="/var/run/mysqld/mysqld_${UNIQUE_ID}.sock"
-    PID_FILE="/run/mysqld/mysqld_${UNIQUE_ID}.pid"
-    DATA_DIR="/var/lib/mysql_${UNIQUE_ID}"
+# ----------------------------
+# Configure MariaDB (charset + secure)
+# ----------------------------
+configure_mariadb() {
+    echo -e "${BLUE}Configuring MariaDB settings...${NC}"
 
-    export SOCKET_FILE
-    export PID_FILE
-    export DATA_DIR
-
-    # Ensure directories exist
-    mkdir -p /var/run/mysqld
-    mkdir -p "$DATA_DIR"
-    chown -R mysql:mysql /var/run/mysqld
-    chown -R mysql:mysql "$DATA_DIR"
-
-    # Initialize the database if it doesn't exist
-    if [ ! -d "$DATA_DIR/mysql" ]; then
-        echo -e "${BLUE}Initializing MariaDB data directory...${NC}"
-        mysql_install_db --user=mysql --datadir="$DATA_DIR" --auth-root-authentication-method=normal
-    fi
-
-    # Create custom configuration file
-    CUSTOM_CNF="/etc/mysql/mariadb.conf.d/99-custom_${UNIQUE_ID}.cnf"
+    CUSTOM_CNF="/etc/mysql/mariadb.conf.d/99-frappe.cnf"
     cat <<EOF > "$CUSTOM_CNF"
 [mysqld]
-datadir = $DATA_DIR
-socket = $SOCKET_FILE
-pid-file = $PID_FILE
-bind-address = 127.0.0.1
 character-set-server = utf8mb4
 collation-server = utf8mb4_unicode_ci
 character-set-client-handshake = FALSE
+bind-address = 127.0.0.1
 
 [client]
-socket = $SOCKET_FILE
+default-character-set = utf8mb4
 EOF
 
-    # Start MariaDB with custom configuration
-    mysqld_safe --defaults-file="$CUSTOM_CNF" &
-
-    # Wait until MariaDB is running
-    for i in {1..10}; do
-        if mysqladmin --socket="$SOCKET_FILE" ping --silent; then
-            echo -e "${GREEN}MariaDB is running.${NC}"
-            return 0
-        else
-            echo -e "${YELLOW}Waiting for MariaDB to start... ($i/10)${NC}"
-            sleep 2
-        fi
-    done
-
-    echo -e "${RED}MariaDB did not start within the expected time.${NC}"
-    exit 1
+    systemctl restart mariadb
+    sleep 3
+    echo -e "${GREEN}MariaDB configured.${NC}"
 }
 
-# Secure MariaDB Installation
+configure_mariadb
+
+# ----------------------------
+# Secure MariaDB (only if no password was set before)
+# ----------------------------
 secure_mariadb() {
     echo -e "${BLUE}Securing MariaDB installation...${NC}"
-
-    # Use mysql to connect via socket
-    mysql --socket="$SOCKET_FILE" -u root <<EOF
+    mysql -u root <<EOF
 DELETE FROM mysql.user WHERE User='';
-DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1');
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
 DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
--- Use GRANT to set password and privileges for 'root'@'127.0.0.1'
-GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' IDENTIFIED BY '$mariadb_password' WITH GRANT OPTION;
 ALTER USER 'root'@'localhost' IDENTIFIED BY '$mariadb_password';
 FLUSH PRIVILEGES;
 EOF
-
-    echo -e "${GREEN}MariaDB has been secured successfully.${NC}"
+    echo -e "${GREEN}MariaDB secured successfully.${NC}"
 }
 
-# Run the functions
-install_mariadb
-start_mariadb
-secure_mariadb
+if [ "$MARIADB_HAS_ROOT_PASSWORD" = false ]; then
+    secure_mariadb
+else
+    echo -e "${YELLOW}Skipping MariaDB secure step (password already configured).${NC}"
+fi
 
-# Install necessary packages
-echo -e "${BLUE}Installing additional packages...${NC}"
-apt-get install -y git python3-dev python3-setuptools python3-pip python3-distutils redis-server python3-venv xvfb libfontconfig
+# ----------------------------
+# Install Redis
+# ----------------------------
+echo -e "${BLUE}Installing Redis...${NC}"
+apt-get install -y redis-server
+systemctl enable redis-server
+systemctl start redis-server
 
+# ----------------------------
 # Install wkhtmltopdf
+# ----------------------------
 echo -e "${BLUE}Installing wkhtmltopdf...${NC}"
-wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-apt install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-rm wkhtmltox_0.12.6.1-2.jammy_amd64.deb
+apt-get install -y xvfb libfontconfig
 
-# Install Node.js 18.x
-echo -e "${BLUE}Installing Node.js 18.x...${NC}"
-curl -s https://deb.nodesource.com/gpgkey/nodesource.gpg.key | gpg --dearmor | sudo tee /usr/share/keyrings/nodesource-archive-keyring.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/nodesource-archive-keyring.gpg] https://deb.nodesource.com/node_18.x $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/nodesource.list
-apt-get update -y
-apt-get install -y nodejs
+ARCH=$(dpkg --print-architecture)
+DISTRO_CODENAME=$(lsb_release -cs)
 
-# Set Up Bench Environment
+# Map codename for supported builds
+case "$DISTRO_CODENAME" in
+    noble|jammy|focal)
+        WKHTML_DEB="wkhtmltox_0.12.6.1-2.${DISTRO_CODENAME}_${ARCH}.deb"
+        WKHTML_URL="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/${WKHTML_DEB}"
+        ;;
+    *)
+        # Fallback to jammy build
+        WKHTML_DEB="wkhtmltox_0.12.6.1-2.jammy_amd64.deb"
+        WKHTML_URL="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/${WKHTML_DEB}"
+        ;;
+esac
+
+if ! command -v wkhtmltopdf &>/dev/null; then
+    wget -q "$WKHTML_URL" -O "$WKHTML_DEB"
+    apt-get install -y "./$WKHTML_DEB"
+    rm -f "$WKHTML_DEB"
+    echo -e "${GREEN}wkhtmltopdf installed.${NC}"
+else
+    echo -e "${YELLOW}wkhtmltopdf already installed, skipping.${NC}"
+fi
+
+# ----------------------------
+# Install nvm + Node.js 24 + yarn
+# ----------------------------
+echo -e "${BLUE}Installing nvm, Node.js 24, and yarn for user '$username'...${NC}"
+
+USER_HOME=$(eval echo "~$username")
+
+# Install nvm for the target user
+sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+"
+
+# Source nvm and install node 24
+sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  export NVM_DIR=\"$USER_HOME/.nvm\"
+  source \"\$NVM_DIR/nvm.sh\"
+  nvm install 24
+  nvm alias default 24
+  npm install -g yarn
+  echo 'Node version:' \$(node -v)
+  echo 'Yarn version:' \$(yarn -v)
+"
+
+# Make node/yarn available system-wide via symlinks
+NODE_BIN=$(sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  export NVM_DIR=\"$USER_HOME/.nvm\"
+  source \"\$NVM_DIR/nvm.sh\"
+  which node
+")
+YARN_BIN=$(sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  export NVM_DIR=\"$USER_HOME/.nvm\"
+  source \"\$NVM_DIR/nvm.sh\"
+  which yarn
+")
+
+ln -sf "$NODE_BIN" /usr/local/bin/node 2>/dev/null || true
+ln -sf "$YARN_BIN" /usr/local/bin/yarn 2>/dev/null || true
+echo -e "${GREEN}Node.js 24 and yarn installed.${NC}"
+
+# ----------------------------
+# Install uv + Python 3.14
+# ----------------------------
+echo -e "${BLUE}Installing uv and Python 3.14 for user '$username'...${NC}"
+
+sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+"
+
+# Add uv to PATH and install Python 3.14
+sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  export PATH=\"$USER_HOME/.local/bin:\$PATH\"
+  uv python install 3.14 --default
+  echo 'Python version:' \$(uv run python --version)
+"
+
+# Symlink python3 to uv-managed python if needed
+PYTHON_BIN=$(sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  export PATH=\"$USER_HOME/.local/bin:\$PATH\"
+  uv python find 3.14
+" 2>/dev/null || echo "")
+
+if [ -n "$PYTHON_BIN" ]; then
+    ln -sf "$PYTHON_BIN" /usr/local/bin/python3.14 2>/dev/null || true
+    echo -e "${GREEN}Python 3.14 available at: $PYTHON_BIN${NC}"
+fi
+
+# ----------------------------
+# Install Bench CLI via uv
+# ----------------------------
+echo -e "${BLUE}Installing frappe-bench via uv tool...${NC}"
+
+sudo -H -u "$username" bash -c "
+  export HOME=$USER_HOME
+  export PATH=\"$USER_HOME/.local/bin:\$PATH\"
+  uv tool install frappe-bench
+  echo 'Bench version:' \$(bench --version 2>/dev/null || echo 'check PATH')
+"
+
+# Symlink bench globally
+BENCH_BIN="$USER_HOME/.local/bin/bench"
+ln -sf "$BENCH_BIN" /usr/local/bin/bench 2>/dev/null || true
+
+# ----------------------------
+# Set Up Bench Directory
+# ----------------------------
 echo -e "${BLUE}Setting up Bench environment...${NC}"
 
-# Create /var/bench directory if it doesn't exist
 if [ ! -d "/var/bench" ]; then
     mkdir /var/bench
 fi
+chown -R "$username":"$username" /var/bench
 
-# Change ownership to the user
-sudo chown -R "$username":"$username" /var/bench
+# ----------------------------
+# Initialize Frappe Bench v16
+# ----------------------------
+echo -e "${BLUE}Initializing Frappe Bench Version 16...${NC}"
 
-# Install frappe-bench and yarn
-sudo pip3 install frappe-bench
-sudo npm install -g yarn
+BENCH_DIR="frappe-bench16_${UNIQUE_ID}"
 
-# Initialize Frappe Bench
-echo -e "${BLUE}Initializing Frappe Bench Version 15...${NC}"
-
-# Run commands as the specified user
 sudo -H -u "$username" bash -c "
-cd /var/bench
-bench init --verbose --frappe-path https://github.com/frappe/frappe --frappe-branch version-15 --python /usr/bin/python3 frappe-bench15_${UNIQUE_ID}
-cd frappe-bench15_${UNIQUE_ID}
+  export HOME=$USER_HOME
+  export PATH=\"$USER_HOME/.local/bin:$USER_HOME/.nvm/versions/node/\$(ls $USER_HOME/.nvm/versions/node/ | sort -V | tail -1)/bin:\$PATH\"
+  export NVM_DIR=\"$USER_HOME/.nvm\"
+  source \"\$NVM_DIR/nvm.sh\" 2>/dev/null || true
+  cd /var/bench
+  bench init --verbose \
+    --frappe-path https://github.com/frappe/frappe \
+    --frappe-branch version-16 \
+    --python \$(uv python find 3.14 2>/dev/null || echo python3.14) \
+    $BENCH_DIR
 "
 
-# Ensure MariaDB is running
-start_mariadb
+echo -e "${GREEN}Frappe Bench v16 initialized at /var/bench/$BENCH_DIR${NC}"
 
-# Create a new site
+# ----------------------------
+# Create New Site
+# ----------------------------
+echo -e "${BLUE}Creating new site '$site_name'...${NC}"
+
 sudo -H -u "$username" bash -c "
-cd /var/bench/frappe-bench15_${UNIQUE_ID}
-bench new-site '$site_name' --db-root-password '$mariadb_password' --admin-password '$admin_password'
-bench use '$site_name'
-bench enable-scheduler
-bench set-config developer_mode 1
-bench --site '$site_name' set-maintenance-mode off
-./env/bin/pip3 install cython==0.29.21
-./env/bin/pip3 install numpy numpy-financial
+  export HOME=$USER_HOME
+  export PATH=\"$USER_HOME/.local/bin:$USER_HOME/.nvm/versions/node/\$(ls $USER_HOME/.nvm/versions/node/ | sort -V | tail -1)/bin:\$PATH\"
+  export NVM_DIR=\"$USER_HOME/.nvm\"
+  source \"\$NVM_DIR/nvm.sh\" 2>/dev/null || true
+  cd /var/bench/$BENCH_DIR
+  bench new-site '$site_name' \
+    --db-root-password '$mariadb_password' \
+    --admin-password '$admin_password'
+  bench use '$site_name'
+  bench enable-scheduler
+  bench set-config developer_mode 1
+  bench --site '$site_name' set-maintenance-mode off
 "
 
-# Install ERPNext if selected
+echo -e "${GREEN}Site '$site_name' created successfully.${NC}"
+
+# ----------------------------
+# Install ERPNext v16 (optional)
+# ----------------------------
 if [ "$install_erpnext" = "yes" ]; then
-    echo -e "${BLUE}Installing ERPNext for Frappe Version 15...${NC}"
+    echo -e "${BLUE}Installing ERPNext for Frappe Version 16...${NC}"
     sudo -H -u "$username" bash -c "
-    cd /var/bench/frappe-bench15_${UNIQUE_ID}
-    bench get-app erpnext --branch version-15
-    bench install-app erpnext
-    ./env/bin/pip3 install -e apps/erpnext/
+      export HOME=$USER_HOME
+      export PATH=\"$USER_HOME/.local/bin:$USER_HOME/.nvm/versions/node/\$(ls $USER_HOME/.nvm/versions/node/ | sort -V | tail -1)/bin:\$PATH\"
+      export NVM_DIR=\"$USER_HOME/.nvm\"
+      source \"\$NVM_DIR/nvm.sh\" 2>/dev/null || true
+      cd /var/bench/$BENCH_DIR
+      bench get-app erpnext --branch version-16
+      bench --site '$site_name' install-app erpnext
     "
-    echo -e "${GREEN}ERPNext has been installed successfully.${NC}"
+    echo -e "${GREEN}ERPNext v16 installed successfully.${NC}"
 else
     echo -e "${YELLOW}Skipping ERPNext installation.${NC}"
 fi
 
-# Install HRMS if selected
+# ----------------------------
+# Install HRMS v16 (optional)
+# ----------------------------
 if [ "$install_hrms" = "yes" ]; then
-    echo -e "${BLUE}Installing HRMS for Frappe Version 15...${NC}"
+    echo -e "${BLUE}Installing HRMS for Frappe Version 16...${NC}"
     sudo -H -u "$username" bash -c "
-    cd /var/bench/frappe-bench15_${UNIQUE_ID}
-    bench get-app hrms --branch version-15
-    bench install-app hrms
-    ./env/bin/pip3 install -e apps/hrms/
+      export HOME=$USER_HOME
+      export PATH=\"$USER_HOME/.local/bin:$USER_HOME/.nvm/versions/node/\$(ls $USER_HOME/.nvm/versions/node/ | sort -V | tail -1)/bin:\$PATH\"
+      export NVM_DIR=\"$USER_HOME/.nvm\"
+      source \"\$NVM_DIR/nvm.sh\" 2>/dev/null || true
+      cd /var/bench/$BENCH_DIR
+      bench get-app hrms --branch version-16
+      bench --site '$site_name' install-app hrms
     "
-    echo -e "${GREEN}HRMS has been installed successfully.${NC}"
+    echo -e "${GREEN}HRMS v16 installed successfully.${NC}"
 else
     echo -e "${YELLOW}Skipping HRMS installation.${NC}"
 fi
@@ -320,24 +460,29 @@ fi
 # Configure System for Redis
 # ----------------------------
 echo -e "${BLUE}Configuring system for Redis optimizations...${NC}"
-echo 'never' | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
-echo 'vm.overcommit_memory = 1' | sudo tee -a /etc/sysctl.conf
-sudo sysctl -w vm.overcommit_memory=1
-echo 'net.core.somaxconn = 511' | sudo tee -a /etc/sysctl.conf
-sudo sysctl -w net.core.somaxconn=511
+echo 'never' | tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null 2>&1 || true
+
+grep -qxF 'vm.overcommit_memory = 1' /etc/sysctl.conf || echo 'vm.overcommit_memory = 1' | tee -a /etc/sysctl.conf
+sysctl -w vm.overcommit_memory=1 > /dev/null
+
+grep -qxF 'net.core.somaxconn = 511' /etc/sysctl.conf || echo 'net.core.somaxconn = 511' | tee -a /etc/sysctl.conf
+sysctl -w net.core.somaxconn=511 > /dev/null
 
 # ----------------------------
-# Installation Resume
+# Installation Summary
 # ----------------------------
 echo -e "${MAGENTA}#######################"
-echo "## Installation Complete ##"
+echo "##  Installation Complete  ##"
 echo -e "#######################${NC}"
-echo -e "${GREEN}MariaDB password is set."
-echo "Administrator password is set."
-echo "Your new bench is located at /var/bench/frappe-bench15_${UNIQUE_ID}/"
-echo "To start using your bench, switch to the '$username' user and navigate to /var/bench/frappe-bench15_${UNIQUE_ID}/"
-echo -e "Example:${NC}"
-echo -e "${YELLOW}  sudo su - $username"
-echo "  cd /var/bench/frappe-bench15_${UNIQUE_ID}"
+echo -e "${GREEN}✔  Frappe / ERPNext version  : 16"
+echo "✔  MariaDB                   : 11.8"
+echo "✔  Python                    : 3.14 (via uv)"
+echo "✔  Node.js                   : 24 (via nvm)"
+echo "✔  Bench directory           : /var/bench/$BENCH_DIR"
+echo "✔  Site                      : $site_name"
+echo ""
+echo "To start the bench, switch to user '$username' and run:"
+echo -e "${NC}${YELLOW}  sudo su - $username"
+echo "  cd /var/bench/$BENCH_DIR"
 echo -e "  bench start${NC}"
 echo -e "${MAGENTA}#######################${NC}"
